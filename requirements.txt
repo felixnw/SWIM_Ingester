@@ -1,0 +1,3 @@
+xmltodict
+psycopg2
+solace-pubsubplus

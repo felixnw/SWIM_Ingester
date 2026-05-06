@@ -1,0 +1,17 @@
+swim_username = "your_scds_username"
+swim_password = "your_scds_password"
+
+tfm_queue_name = "your_tfm_queue_name"
+sfdps_queue_name = "your_fdps_queue_name"
+
+db_params = {
+    "host": "localhost",
+    "database": "database_name",
+    "user": "your_username",
+    "password": "your_password",
+    "port": 5432,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5
+}
