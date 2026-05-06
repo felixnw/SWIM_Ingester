@@ -13,7 +13,7 @@ from solace.messaging.resources.queue import Queue
 import config
 
 # Configure logging to see errors without stopping the script
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Create DB connection
@@ -27,9 +27,11 @@ except Exception as e:
 class MyConnectionListener(ReconnectionListener, ReconnectionAttemptListener):
     def on_reconnecting(self, event):
         logging.warning(f"SOLACE: Connection lost. Attempting to reconnect... {event}")
+        print("SOLACE: Connection lost. Attempting to reconnect...")
 
     def on_reconnected(self, event):
         logging.info(f"SOLACE: Reconnection successful! {event}")
+        print("SOLACE: Reconnection successful!")
 
 # 1. Define Message Handlers
 class TFMMessageHandler(MessageHandler):
