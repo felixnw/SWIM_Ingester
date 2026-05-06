@@ -5,7 +5,7 @@ import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from solace.messaging.messaging_service import MessagingService, RetryStrategy
+from solace.messaging.messaging_service import MessagingService, RetryStrategy, ReconnectionListener, ReconnectionAttemptListener
 from solace.messaging.receiver.message_receiver import MessageHandler, InboundMessage
 from solace.messaging.resources.queue import Queue
 
@@ -23,6 +23,13 @@ try:
 except Exception as e:
     logger.error(f"Database connection failed: {e}")
     exit(1)  # Exit if we can't connect to the database, since it's critical for processing messages
+
+class MyConnectionListener(ReconnectionListener, ReconnectionAttemptListener):
+    def on_reconnecting(self, event):
+        logging.warning(f"SOLACE: Connection lost. Attempting to reconnect... {event}")
+
+    def on_reconnected(self, event):
+        logging.info(f"SOLACE: Reconnection successful! {event}")
 
 # 1. Define Message Handlers
 class TFMMessageHandler(MessageHandler):
@@ -131,7 +138,7 @@ class TFMMessageHandler(MessageHandler):
         query = """
             INSERT INTO flights (
                 gufi, callsign, operator, major, origin, destination, 
-                aircraft_type, original_eta, updated_eta, original_etd, updated_etd, status
+                aircraft_type, original_eta, updated_eta, original_etd, updated_etd, flight_status
             ) VALUES (
                 %(gufi)s, %(callsign)s, %(operator)s, %(major)s, %(origin)s, %(destination)s, 
                 %(aircraft_type)s, %(eta)s, %(eta)s, %(etd)s, %(etd)s, %(status)s
@@ -140,7 +147,7 @@ class TFMMessageHandler(MessageHandler):
                 callsign = EXCLUDED.callsign,
                 updated_eta = EXCLUDED.updated_eta,
                 updated_etd = EXCLUDED.updated_etd,
-                status = EXCLUDED.status,
+                flight_status = EXCLUDED.flight_status,
                 last_updated = CURRENT_TIMESTAMP;
         """
         try:
@@ -148,8 +155,12 @@ class TFMMessageHandler(MessageHandler):
             with self.db_conn.cursor() as cur:
                 cur.execute(query, data)
                 self.db_conn.commit()
+        except psycopg2.OperationalError as e:
+            print(f"Database connection error during upsert for GUFI {data.get('gufi')}: {e}")
+            logging.error(f"DATABASE TIMEOUT/DROP: Connection is dead. Error: {e}")
         except Exception as e:
             self.db_conn.rollback()
+            print(f"DB Upsert Failed for GUFI {data.get('gufi')}: {e}")
             logger.error(f"DB Upsert Failed: {e}")
 
 # class SFDPSHandler(MessageHandler):
@@ -199,6 +210,9 @@ tfm_messaging_service = MessagingService.builder().from_properties(tfm_broker_pr
 tfm_messaging_service.connect()
 # sfdps_messaging_service.connect()
 print("Connected to FAA SWIM SCDS via Solace.")
+
+tfm_messaging_service.add_reconnection_listener(MyConnectionListener())
+tfm_messaging_service.add_reconnection_attempt_listener(MyConnectionListener())
 
 # 4. Subscribe to a Topic or Queue
 # Convert the string name into a Queue Resource object
