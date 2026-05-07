@@ -1,123 +1,403 @@
 import time
-import xmltodict
 import logging
+import signal
+from threading import Thread, Event
+from queue import Queue as ThreadQueue, Full, Empty
 
+import xmltodict
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import execute_batch
 
-from solace.messaging.messaging_service import MessagingService, RetryStrategy, ReconnectionListener, ReconnectionAttemptListener
-from solace.messaging.receiver.message_receiver import MessageHandler, InboundMessage
+from solace.messaging.messaging_service import (
+    MessagingService,
+    RetryStrategy,
+    ReconnectionListener,
+    ReconnectionAttemptListener,
+)
+
+from solace.messaging.receiver.message_receiver import (
+    MessageHandler,
+    InboundMessage,
+)
+
 from solace.messaging.resources.queue import Queue
 
-# --- IMPORT YOUR PRIVATE CONFIG ---
+# --- PRIVATE CONFIG ---
 import config
 
-# Configure logging to see errors without stopping the script
-logging.basicConfig(level=logging.DEBUG)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(threadName)s - %(message)s",
+)
+
 logger = logging.getLogger(__name__)
 
-# Create DB connection
-try:
-    conn = psycopg2.connect(**config.db_params)
-    logger.info("Successfully connected to the database.")
-except Exception as e:
-    logger.error(f"Database connection failed: {e}")
-    exit(1)  # Exit if we can't connect to the database, since it's critical for processing messages
 
-class MyConnectionListener(ReconnectionListener, ReconnectionAttemptListener):
+# ============================================================
+# GLOBALS
+# ============================================================
+
+RUNNING = Event()
+RUNNING.set()
+
+FLIGHT_QUEUE_MAXSIZE = 10000
+DB_BATCH_SIZE = 100
+DB_BATCH_TIMEOUT = 2
+
+flight_queue = ThreadQueue(maxsize=FLIGHT_QUEUE_MAXSIZE)
+
+
+# ============================================================
+# DATABASE CONNECTION POOL
+# ============================================================
+
+try:
+    db_pool = ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+        **config.db_params,
+    )
+
+    logger.info("Database connection pool created.")
+
+except Exception as e:
+    logger.exception(f"Failed to create DB pool: {e}")
+    raise
+
+
+def get_db_connection():
+    conn = db_pool.getconn()
+
+    with conn.cursor() as cur:
+        cur.execute("SET statement_timeout = '30000';")
+
+    return conn
+
+
+def release_db_connection(conn):
+    try:
+        db_pool.putconn(conn)
+    except Exception:
+        logger.exception("Failed to release DB connection")
+
+
+# ============================================================
+# SOLACE RECONNECTION LISTENERS
+# ============================================================
+
+class MyConnectionListener(
+    ReconnectionListener,
+    ReconnectionAttemptListener,
+):
+
     def on_reconnecting(self, event):
-        logging.warning(f"SOLACE: Connection lost. Attempting to reconnect... {event}")
-        print("SOLACE: Connection lost. Attempting to reconnect...")
+        logger.warning(f"SOLACE reconnecting: {event}")
 
     def on_reconnected(self, event):
-        logging.info(f"SOLACE: Reconnection successful! {event}")
-        print("SOLACE: Reconnection successful!")
+        logger.info(f"SOLACE reconnected: {event}")
 
-# 1. Define Message Handlers
+
+# ============================================================
+# DATABASE WORKER THREAD
+# ============================================================
+
+UPSERT_QUERY = """
+INSERT INTO flights (
+    gufi,
+    callsign,
+    operator,
+    major,
+    origin,
+    destination,
+    aircraft_type,
+    original_eta,
+    updated_eta,
+    original_etd,
+    updated_etd,
+    flight_status
+)
+VALUES (
+    %(gufi)s,
+    %(callsign)s,
+    %(operator)s,
+    %(major)s,
+    %(origin)s,
+    %(destination)s,
+    %(aircraft_type)s,
+    %(eta)s,
+    %(eta)s,
+    %(etd)s,
+    %(etd)s,
+    %(status)s
+)
+ON CONFLICT (gufi)
+DO UPDATE SET
+    callsign = EXCLUDED.callsign,
+    operator = EXCLUDED.operator,
+    major = EXCLUDED.major,
+    origin = EXCLUDED.origin,
+    destination = EXCLUDED.destination,
+    aircraft_type = EXCLUDED.aircraft_type,
+    updated_eta = EXCLUDED.updated_eta,
+    updated_etd = EXCLUDED.updated_etd,
+    flight_status = EXCLUDED.flight_status,
+    last_updated = CURRENT_TIMESTAMP;
+"""
+
+
+class DBWorker(Thread):
+
+    def __init__(self, worker_id: int):
+        super().__init__(daemon=True)
+        self.worker_id = worker_id
+        self.conn = None
+
+    def connect(self):
+        while RUNNING.is_set():
+            try:
+                self.conn = get_db_connection()
+                logger.info(f"DBWorker-{self.worker_id}: Connected to DB")
+                return
+
+            except Exception:
+                logger.exception(
+                    f"DBWorker-{self.worker_id}: DB connection failed"
+                )
+                time.sleep(5)
+
+    def ensure_connection(self):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        except Exception:
+            logger.warning(
+                f"DBWorker-{self.worker_id}: Reconnecting DB..."
+            )
+
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+            self.connect()
+
+    def flush_batch(self, batch):
+        if not batch:
+            return
+
+        self.ensure_connection()
+
+        try:
+            with self.conn.cursor() as cur:
+                execute_batch(
+                    cur,
+                    UPSERT_QUERY,
+                    batch,
+                    page_size=DB_BATCH_SIZE,
+                )
+
+            self.conn.commit()
+
+            logger.info(
+                f"DBWorker-{self.worker_id}: Upserted {len(batch)} flights"
+            )
+
+        except psycopg2.OperationalError:
+            logger.exception(
+                f"DBWorker-{self.worker_id}: Operational DB failure"
+            )
+
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+            self.connect()
+
+        except Exception:
+            logger.exception(
+                f"DBWorker-{self.worker_id}: Batch upsert failed"
+            )
+
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def run(self):
+
+        self.connect()
+
+        batch = []
+        last_flush = time.time()
+
+        while RUNNING.is_set():
+
+            try:
+                timeout = max(
+                    0.1,
+                    DB_BATCH_TIMEOUT - (time.time() - last_flush),
+                )
+
+                item = flight_queue.get(timeout=timeout)
+
+                batch.append(item)
+
+                flight_queue.task_done()
+
+                if len(batch) >= DB_BATCH_SIZE:
+                    self.flush_batch(batch)
+                    batch.clear()
+                    last_flush = time.time()
+
+            except Empty:
+
+                if batch:
+                    self.flush_batch(batch)
+                    batch.clear()
+                    last_flush = time.time()
+
+            except Exception:
+                logger.exception(
+                    f"DBWorker-{self.worker_id}: Unexpected worker error"
+                )
+                time.sleep(1)
+
+        if batch:
+            self.flush_batch(batch)
+
+        if self.conn:
+            release_db_connection(self.conn)
+
+        logger.info(f"DBWorker-{self.worker_id}: Stopped")
+
+
+# ============================================================
+# TFM MESSAGE HANDLER
+# ============================================================
+
 class TFMMessageHandler(MessageHandler):
-    def __init__(self, db_conn):
-            self.db_conn = db_conn
+
+    namespaces_to_ignore = {
+        'urn:us:gov:dot:faa:atm:tfm:tfmdataservice': None,
+        'urn:us:gov:dot:faa:atm:tfm:flightdata': None,
+        'urn:us:gov:dot:faa:atm:tfm:tfmdatacoreelements': None,
+        'urn:us:gov:dot:faa:atm:tfm:flightdatacommonmessages': None
+    }
 
     def on_message(self, message: InboundMessage):
+
         try:
             payload = message.get_payload_as_string()
 
-            # Strips the long FAA URIs so we can use clean keys like 'gufi' instead of 'nxce:gufi'
-            namespaces_to_ignore = {
-                'urn:us:gov:dot:faa:atm:tfm:tfmdataservice': None,
-                'urn:us:gov:dot:faa:atm:tfm:flightdata': None,
-                'urn:us:gov:dot:faa:atm:tfm:tfmdatacoreelements': None,
-                'urn:us:gov:dot:faa:atm:tfm:flightdatacommonmessages': None
-            }
-                    
-            data = xmltodict.parse(payload, process_namespaces=True, namespaces=namespaces_to_ignore)
-            
-            # TFM batches multiple flights in one XML delivery
-            root = data.get('tfmDataService', {})
-            output = root.get('fltdOutput', {})
-            messages = output.get('fltdMessage', [])
+            data = xmltodict.parse(
+                payload,
+                process_namespaces=True,
+                namespaces=self.namespaces_to_ignore,
+            )
 
-            # xmltodict quirk: if there is only 1 flight, it returns a dict. Force it to a list.
+            root = data.get("tfmDataService", {})
+            output = root.get("fltdOutput", {})
+            messages = output.get("fltdMessage", [])
+
             if isinstance(messages, dict):
                 messages = [messages]
-            
+
             for msg in messages:
+
                 flight_data = self.parse_tfm_fields(msg)
-                
-                if flight_data and flight_data.get('gufi'):
-                    # Call your DB Upsert logic
-                    self.upsert_flight(flight_data)
-                    print(f"Updated TFM: {flight_data['callsign']} | {flight_data['operator']} | GUFI: {flight_data['gufi']} | "
-      f"Major: {flight_data['major']} | Origin: {flight_data['origin']} | Dest: {flight_data['destination']} | "
-      f"Type: {flight_data['aircraft_type']} | ETA: {flight_data['eta']} | ETD: {flight_data['etd']} | Status: {flight_data['status']}")
 
-        except Exception as e:
-            logger.error(f"Error processing TFM message: {e}")
-            
+                if not flight_data:
+                    continue
+
+                if not flight_data.get("gufi"):
+                    continue
+
+                try:
+                    flight_queue.put_nowait(flight_data)
+
+                except Full:
+                    logger.error(
+                        "Flight queue full. Dropping message."
+                    )
+
+        except Exception:
+            logger.exception("Failed processing TFM message")
+
     def parse_tfm_fields(self, msg):
-        """Helper to navigate polymorphic TFM XML structures"""
+
         try:
-            # 1. Top-level attributes (Reliably present in the fltdMessage tag)
-            callsign = msg.get('@acid')
-            operator = msg.get('@airline')
-            major = msg.get('@major')
-            origin = msg.get('@depArpt')
-            destination = msg.get('@arrArpt')
 
-            # 2. Identify the message body (Polymorphic container)
-            # This looks for the data in whatever message type the FAA sent
-            body = (msg.get('ncsmFlightModify') or 
-                    msg.get('nccmFlightModify') or # Handling potential typos in SWIM feeds
-                    msg.get('ncsmFlightTimes') or 
-                    msg.get('trackInformation') or {})
+            callsign = msg.get("@acid")
+            operator = msg.get("@airline")
+            major = msg.get("@major")
+            origin = msg.get("@depArpt")
+            destination = msg.get("@arrArpt")
 
-            # 3. Drilling into the ID block
-            qualified_id = body.get('qualifiedAircraftId', {})
-            gufi = qualified_id.get('gufi')
-            
-            # 4. Extract Times (Coalesce logic)
-            # igtd = Initial Gated Departure (Great for 'original_etd')
-            etd = (qualified_id.get('igtd') or 
-                   body.get('etd', {}).get('@timeValue') or
-                   body.get('airlineData', {}).get('etd', {}).get('@timeValue'))
+            body = (
+                msg.get("ncsmFlightModify")
+                or msg.get("nccmFlightModify")
+                or msg.get("ncsmFlightTimes")
+                or msg.get("trackInformation")
+                or {}
+            )
 
-            eta = (body.get('eta', {}).get('@timeValue') or 
-                   body.get('airlineData', {}).get('eta', {}).get('@timeValue'))
-            
-            # 5. Extract Status
-            status_spec = (body.get('flightStatusAndSpec') or 
-                           body.get('airlineData', {}).get('flightStatusAndSpec') or {})
-            status = status_spec.get('flightStatus')
+            qualified_id = body.get(
+                "qualifiedAircraftId",
+                {}
+            )
 
-            # 6. Extract Aircraft Type (Model > Spec > Category)
-            status_spec = (body.get('flightStatusAndSpec') or 
-                           body.get('airlineData', {}).get('flightStatusAndSpec') or {})
-            
-            spec_raw = status_spec.get('aircraftSpecification')
-            spec_text = spec_raw.get('#text') if isinstance(spec_raw, dict) else spec_raw
+            gufi = qualified_id.get("gufi")
 
-            aircraft_type = (status_spec.get('aircraftModel') or 
-                             spec_text)
+            etd = (
+                qualified_id.get("igtd")
+                or body.get("etd", {}).get("@timeValue")
+                or body.get("airlineData", {})
+                    .get("etd", {})
+                    .get("@timeValue")
+            )
+
+            eta = (
+                body.get("eta", {}).get("@timeValue")
+                or body.get("airlineData", {})
+                    .get("eta", {})
+                    .get("@timeValue")
+            )
+
+            status_spec = (
+                body.get("flightStatusAndSpec")
+                or body.get("airlineData", {})
+                    .get("flightStatusAndSpec")
+                or {}
+            )
+
+            status = status_spec.get("flightStatus")
+
+            spec_raw = status_spec.get(
+                "aircraftSpecification"
+            )
+
+            spec_text = (
+                spec_raw.get("#text")
+                if isinstance(spec_raw, dict)
+                else spec_raw
+            )
+
+            aircraft_type = (
+                status_spec.get("aircraftModel")
+                or spec_text
+            )
 
             return {
                 "gufi": gufi,
@@ -129,120 +409,163 @@ class TFMMessageHandler(MessageHandler):
                 "aircraft_type": aircraft_type,
                 "eta": eta,
                 "etd": etd,
-                "status": status
+                "status": status,
             }
-    
-        except Exception as e:
-            logger.error(f"Error parsing TFM fields: {e}")
+
+        except Exception:
+            logger.exception("Failed parsing TFM fields")
             return None
-        
-    def upsert_flight(self, data):
-        query = """
-            INSERT INTO flights (
-                gufi, callsign, operator, major, origin, destination, 
-                aircraft_type, original_eta, updated_eta, original_etd, updated_etd, flight_status
-            ) VALUES (
-                %(gufi)s, %(callsign)s, %(operator)s, %(major)s, %(origin)s, %(destination)s, 
-                %(aircraft_type)s, %(eta)s, %(eta)s, %(etd)s, %(etd)s, %(status)s
-            )
-            ON CONFLICT (gufi) DO UPDATE SET
-                callsign = EXCLUDED.callsign,
-                updated_eta = EXCLUDED.updated_eta,
-                updated_etd = EXCLUDED.updated_etd,
-                flight_status = EXCLUDED.flight_status,
-                last_updated = CURRENT_TIMESTAMP;
-        """
-        try:
-            # You need a cursor to execute the query
-            with self.db_conn.cursor() as cur:
-                cur.execute(query, data)
-                self.db_conn.commit()
-        except psycopg2.OperationalError as e:
-            print(f"Database connection error during upsert for GUFI {data.get('gufi')}: {e}")
-            logging.error(f"DATABASE TIMEOUT/DROP: Connection is dead. Error: {e}")
-        except Exception as e:
-            self.db_conn.rollback()
-            print(f"DB Upsert Failed for GUFI {data.get('gufi')}: {e}")
-            logger.error(f"DB Upsert Failed: {e}")
-
-# class SFDPSHandler(MessageHandler):
-#     def on_message(self, message: InboundMessage):
-#         # SFDPS specific logic (Tactical/GUFI data)
-#         payload = message.get_payload_as_string()
-#         # Parse and Upsert DB...
-#         # print(f"\n--- New SFDPS Message Received ---")
-#         # print(payload)
-#         # print("---------------------------------")
 
 
-# 2. Broker Configuration (Use your SCDS credentials)
+# ============================================================
+# SOLACE CONFIG
+# ============================================================
+
 tfm_broker_props = {
-    "solace.messaging.transport.host": "tcps://ems1.swim.faa.gov:55443", 
-    "solace.messaging.service.vpn-name": "TFMS",
-    "solace.messaging.authentication.scheme.basic.username": config.swim_username,
-    "solace.messaging.authentication.scheme.basic.password": config.swim_password,
-    # MANDATORY: Enable Compression for FAA SWIM
-    "solace.messaging.transport.compression-level": "1", 
-    # Disable certificate validation for testing purposes (not recommended for production)
-    "solace.messaging.tls.cert-validated": False,
-    "solace.messaging.tls.cert-validate-servername": False
+    "solace.messaging.transport.host":
+        "tcps://ems1.swim.faa.gov:55443",
+
+    "solace.messaging.service.vpn-name":
+        "TFMS",
+
+    "solace.messaging.authentication.scheme.basic.username":
+        config.swim_username,
+
+    "solace.messaging.authentication.scheme.basic.password":
+        config.swim_password,
+
+    "solace.messaging.transport.compression-level":
+        "1",
+
+    # PRODUCTION:
+    # Replace with real cert validation later
+    "solace.messaging.tls.cert-validated":
+        False,
+
+    "solace.messaging.tls.cert-validate-servername":
+        False,
 }
 
-sfdps_broker_props = {
-    "solace.messaging.transport.host": "tcps://ems1.swim.faa.gov:55443", 
-    "solace.messaging.service.vpn-name": "FDPS",
-    "solace.messaging.authentication.scheme.basic.username": config.swim_username,
-    "solace.messaging.authentication.scheme.basic.password": config.swim_password,
-    # MANDATORY: Enable Compression for FAA SWIM
-    "solace.messaging.transport.compression-level": "1", 
-    # Disable certificate validation for testing purposes (not recommended for production)
-    "solace.messaging.tls.cert-validated": False,
-    "solace.messaging.tls.cert-validate-servername": False
-}
 
-# 3. Build and Connect
-tfm_messaging_service = MessagingService.builder().from_properties(tfm_broker_props) \
-    .with_reconnection_retry_strategy(RetryStrategy.parametrized_retry(20, 3000)) \
+# ============================================================
+# SHUTDOWN HANDLER
+# ============================================================
+
+def shutdown_handler(signum, frame):
+    logger.info("Shutdown signal received...")
+    RUNNING.clear()
+
+
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
+
+
+# ============================================================
+# START DB WORKERS
+# ============================================================
+
+workers = []
+
+for i in range(4):
+
+    worker = DBWorker(worker_id=i + 1)
+
+    worker.start()
+
+    workers.append(worker)
+
+
+# ============================================================
+# CREATE SOLACE SERVICE
+# ============================================================
+
+tfm_messaging_service = (
+    MessagingService.builder()
+    .from_properties(tfm_broker_props)
+    .with_reconnection_retry_strategy(
+        RetryStrategy.parametrized_retry(
+            20,
+            3000,
+        )
+    )
     .build()
-
-# sfdps_messaging_service = MessagingService.builder().from_properties(sfdps_broker_props) \
-#     .with_reconnection_retry_strategy(RetryStrategy.parametrized_retry(20, 3000)) \
-#     .build()
+)
 
 tfm_messaging_service.connect()
-# sfdps_messaging_service.connect()
-print("Connected to FAA SWIM SCDS via Solace.")
 
-tfm_messaging_service.add_reconnection_listener(MyConnectionListener())
-tfm_messaging_service.add_reconnection_attempt_listener(MyConnectionListener())
+logger.info("Connected to FAA SWIM")
 
-# 4. Subscribe to a Topic or Queue
-# Convert the string name into a Queue Resource object
-tfm_queue_name_string = config.tfm_queue_name
-tfm_queue = Queue.durable_exclusive_queue(tfm_queue_name_string)
 
-# sfdps_queue_name_string = sfdps_queue_name
-# sfdps_queue = Queue.durable_exclusive_queue(sfdps_queue_name_string)
+listener = MyConnectionListener()
 
-tfm_receiver = tfm_messaging_service.create_persistent_message_receiver_builder() \
-    .build(tfm_queue) # Pass the object, not the string
+tfm_messaging_service.add_reconnection_listener(listener)
+
+tfm_messaging_service.add_reconnection_attempt_listener(
+    listener
+)
+
+
+# ============================================================
+# QUEUE SUBSCRIPTION
+# ============================================================
+
+tfm_queue = Queue.durable_exclusive_queue(
+    config.tfm_queue_name
+)
+
+tfm_receiver = (
+    tfm_messaging_service
+    .create_persistent_message_receiver_builder()
+    .build(tfm_queue)
+)
 
 tfm_receiver.start()
-tfm_receiver.receive_async(TFMMessageHandler(db_conn=conn))
 
-# sfdps_receiver = sfdps_messaging_service.create_persistent_message_receiver_builder() \
-#     .build(sfdps_queue) # Pass the object, not the string
+tfm_receiver.receive_async(TFMMessageHandler())
 
-# sfdps_receiver.start()
-# sfdps_receiver.receive_async(SFDPSHandler())
+logger.info("TFM receiver started")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 try:
-    while True:
-        time.sleep(1)
+
+    while RUNNING.is_set():
+
+        logger.info(
+            f"Queue depth: {flight_queue.qsize()}"
+        )
+
+        time.sleep(30)
+
 except KeyboardInterrupt:
-    print("Disconnecting...")
+
+    logger.info("Keyboard interrupt received")
+
 finally:
-    tfm_receiver.terminate()
-    # sfdps_receiver.terminate()
-    tfm_messaging_service.disconnect()
-    # sfdps_messaging_service.disconnect()
+
+    logger.info("Shutting down...")
+
+    RUNNING.clear()
+
+    try:
+        tfm_receiver.terminate()
+    except Exception:
+        logger.exception("Receiver shutdown failed")
+
+    try:
+        tfm_messaging_service.disconnect()
+    except Exception:
+        logger.exception("Messaging disconnect failed")
+
+    for worker in workers:
+        worker.join(timeout=10)
+
+    try:
+        db_pool.closeall()
+    except Exception:
+        logger.exception("Failed closing DB pool")
+
+    logger.info("Shutdown complete")
