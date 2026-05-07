@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from sqlalchemy import create_engine, Column, String, DateTime
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional
@@ -10,7 +10,7 @@ from datetime import datetime
 DATABASE_URL = "postgresql://user:password@localhost/dbname"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = DeclarativeBase()
+Base = declarative_base()
 
 # 1. Database Model (SQLAlchemy)
 class FlightDB(Base):
