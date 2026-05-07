@@ -1,3 +1,7 @@
 xmltodict
 psycopg2.binary
 solace-pubsubplus
+fastapi
+sqlalchemy
+pydantic
+uvicorn

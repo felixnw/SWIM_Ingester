@@ -335,6 +335,8 @@ class TFMMessageHandler(MessageHandler):
         except Exception:
             logger.exception("Failed processing TFM message")
 
+        return
+
     def parse_tfm_fields(self, msg):
 
         try:
