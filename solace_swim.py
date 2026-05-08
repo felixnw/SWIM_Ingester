@@ -518,6 +518,7 @@ tfm_queue = Queue.durable_exclusive_queue(
 tfm_receiver = (
     tfm_messaging_service
     .create_persistent_message_receiver_builder()
+    .with_message_auto_acknowledgement()
     .build(tfm_queue)
 )
 

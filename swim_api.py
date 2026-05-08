@@ -69,7 +69,7 @@ def get_flight_by_callsign(callsign: str, db: Session = Depends(get_db)):
 
     # Manually map the DB fields to the API fields
     return FlightResponse(
-        flight_id=flight.gufi,
+        flight_id=flight.callsign,
         registration=flight.tail_number,
         operator=flight.operator,
         major=flight.major,
