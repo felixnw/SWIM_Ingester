@@ -9,7 +9,7 @@ from sqlalchemy import (
     case
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 
@@ -163,15 +163,17 @@ class FlightSource(BaseModel):
     original_etd: Optional[datetime] = None
     original_eta: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
 
 class FlightHit(BaseModel):
     source: FlightSource = Field(alias="_source")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(
+        populate_by_name=True
+    )
 
 
 class HitsContainer(BaseModel):
