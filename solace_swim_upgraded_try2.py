@@ -4,8 +4,8 @@ import time
 import hashlib
 
 from datetime import timezone
-from threading import Event, Thread
-from queue import Queue as ThreadQueue, Empty, Full
+from threading import Event, Thread, Lock
+from queue import Queue as ThreadQueue, Empty
 
 import psycopg2
 import xmltodict
@@ -56,15 +56,23 @@ NUM_PARSE_WORKERS = 8
 NUM_DB_WORKERS = 4
 
 RAW_QUEUE_MAXSIZE = 50000
-DB_QUEUE_MAXSIZE = 10000
 
 DB_BATCH_SIZE = 250
 DB_BATCH_TIMEOUT = 2
 
 raw_queue = ThreadQueue(maxsize=RAW_QUEUE_MAXSIZE)
 
-flight_queues = [
-    ThreadQueue(maxsize=DB_QUEUE_MAXSIZE)
+# ============================================================
+# IN-MEMORY DEDUPE MAPS
+# ============================================================
+
+flight_maps = [
+    {}
+    for _ in range(NUM_DB_WORKERS)
+]
+
+flight_map_locks = [
+    Lock()
     for _ in range(NUM_DB_WORKERS)
 ]
 
@@ -88,7 +96,9 @@ logger.info("DB pool created")
 
 
 def get_db_connection():
+
     conn = db_pool.getconn()
+
     conn.autocommit = False
 
     with conn.cursor() as cur:
@@ -98,6 +108,7 @@ def get_db_connection():
 
 
 def release_db_connection(conn):
+
     if conn:
         db_pool.putconn(conn)
 
@@ -110,6 +121,7 @@ class MyConnectionListener(
     ReconnectionListener,
     ReconnectionAttemptListener,
 ):
+
     def on_reconnecting(self, event):
         logger.warning(f"SOLACE reconnecting: {event}")
 
@@ -217,6 +229,7 @@ def normalize_timestamp(value):
         return None
 
     try:
+
         dt = isoparse(value)
 
         if dt.tzinfo is None:
@@ -225,7 +238,9 @@ def normalize_timestamp(value):
         return dt.astimezone(timezone.utc)
 
     except Exception:
+
         logger.warning(f"Bad timestamp: {value}")
+
         return None
 
 
@@ -274,7 +289,6 @@ def find_payload(msg):
         if isinstance(payload, dict):
             return key, payload
 
-    # fallback discovery mode
     for key, value in msg.items():
 
         if isinstance(value, dict):
@@ -347,7 +361,6 @@ def parse_tfm_fields(msg):
 
         gufi = (
             qualified.get("gufi")
-            or attr(msg, "flightRef")
         )
 
         if not gufi:
@@ -499,7 +512,9 @@ def parse_tfm_fields(msg):
         }
 
     except Exception:
+
         logger.exception("Parse failure")
+
         return None
 
 
@@ -564,17 +579,26 @@ class ParseWorker(Thread):
                             flight["gufi"]
                         )
 
-                        try:
+                        lock = flight_map_locks[idx]
 
-                            flight_queues[idx].put_nowait(
-                                flight
+                        with lock:
+
+                            existing = flight_maps[idx].get(
+                                flight["gufi"]
                             )
 
-                        except Full:
+                            if existing:
 
-                            logger.error(
-                                f"DB queue {idx} full"
-                            )
+                                for k, v in flight.items():
+
+                                    if v is not None:
+                                        existing[k] = v
+
+                            else:
+
+                                flight_maps[idx][
+                                    flight["gufi"]
+                                ] = flight
 
                 finally:
                     raw_queue.task_done()
@@ -583,7 +607,9 @@ class ParseWorker(Thread):
                 continue
 
             except Exception:
+
                 logger.exception("Parse error")
+
                 time.sleep(1)
 
 
@@ -598,7 +624,6 @@ class DBWorker(Thread):
         super().__init__(daemon=True)
 
         self.worker_id = worker_id
-        self.queue = flight_queues[worker_id]
 
         self.conn = None
 
@@ -646,6 +671,31 @@ class DBWorker(Thread):
 
         if not batch:
             return
+
+        # ====================================================
+        # FINAL SAFETY DEDUPE
+        # ====================================================
+
+        deduped = {}
+
+        for r in batch:
+
+            existing = deduped.get(
+                r["gufi"]
+            )
+
+            if existing:
+
+                for k, v in r.items():
+
+                    if v is not None:
+                        existing[k] = v
+
+            else:
+
+                deduped[r["gufi"]] = dict(r)
+
+        batch = list(deduped.values())
 
         self.ensure_connection()
 
@@ -725,44 +775,34 @@ class DBWorker(Thread):
 
         self.connect()
 
-        batch = []
-
-        last_flush = time.time()
-
         while RUNNING.is_set():
 
             try:
 
-                timeout = max(
-                    0.1,
-                    DB_BATCH_TIMEOUT - (
-                        time.time() - last_flush
+                time.sleep(DB_BATCH_TIMEOUT)
+
+                lock = flight_map_locks[
+                    self.worker_id
+                ]
+
+                with lock:
+
+                    if not flight_maps[
+                        self.worker_id
+                    ]:
+                        continue
+
+                    batch = list(
+                        flight_maps[
+                            self.worker_id
+                        ].values()
                     )
-                )
 
-                item = self.queue.get(timeout=timeout)
+                    flight_maps[
+                        self.worker_id
+                    ].clear()
 
-                batch.append(item)
-
-                self.queue.task_done()
-
-                if len(batch) >= DB_BATCH_SIZE:
-
-                    self.flush_batch(batch)
-
-                    batch.clear()
-
-                    last_flush = time.time()
-
-            except Empty:
-
-                if batch:
-
-                    self.flush_batch(batch)
-
-                    batch.clear()
-
-                    last_flush = time.time()
+                self.flush_batch(batch)
 
             except Exception:
 
@@ -772,9 +812,32 @@ class DBWorker(Thread):
 
                 time.sleep(1)
 
-        # flush remaining
-        if batch:
-            self.flush_batch(batch)
+        try:
+
+            lock = flight_map_locks[
+                self.worker_id
+            ]
+
+            with lock:
+
+                batch = list(
+                    flight_maps[
+                        self.worker_id
+                    ].values()
+                )
+
+                flight_maps[
+                    self.worker_id
+                ].clear()
+
+            if batch:
+                self.flush_batch(batch)
+
+        except Exception:
+
+            logger.exception(
+                f"DBWorker-{self.worker_id} final flush failed"
+            )
 
         if self.conn:
             release_db_connection(self.conn)
@@ -798,7 +861,7 @@ class TFMMessageHandler(MessageHandler):
                 message.get_payload_as_string()
             )
 
-        except Full:
+        except Exception:
 
             logger.error("Raw queue full")
 
@@ -893,7 +956,7 @@ try:
 
         logger.info(
             f"RAW={raw_queue.qsize()} "
-            f"DB={[q.qsize() for q in flight_queues]}"
+            f"DB={[len(m) for m in flight_maps]}"
         )
 
         time.sleep(30)
