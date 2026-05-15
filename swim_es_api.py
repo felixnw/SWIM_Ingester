@@ -1,16 +1,16 @@
-from fastapi import FastAPI, HTTPException, Depends, Security, Body
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Depends, Body
 from sqlalchemy import (
     create_engine,
     Column,
     String,
     DateTime,
     desc,
-    case
+    case,
+    or_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 
 # =========================================================
@@ -53,33 +53,6 @@ class FlightDB(Base):
     updated_eta = Column(DateTime)
 
     flight_status = Column(String)
-
-
-# =========================================================
-# Security
-# =========================================================
-
-# API_KEY_NAME = "Authorization"
-
-# api_key_header = APIKeyHeader(
-#     name=API_KEY_NAME,
-#     auto_error=False
-# )
-
-
-# def get_api_key(api_key: str = Security(api_key_header)):
-#     """
-#     Expected header:
-#     Authorization: ApiKey YOUR_KEY
-#     """
-
-#     if api_key and api_key.startswith("ApiKey "):
-#         return api_key
-
-#     raise HTTPException(
-#         status_code=403,
-#         detail="Could not validate credentials"
-#     )
 
 
 # =========================================================
@@ -126,10 +99,6 @@ class QueryModel(BaseModel):
 
 class SortOrder(BaseModel):
     order: str = "desc"
-
-
-class SortField(BaseModel):
-    last_update: Optional[SortOrder] = None
 
 
 class SearchRequest(BaseModel):
@@ -215,8 +184,7 @@ app = FastAPI(title="SWIM-Compatible Flight API")
 )
 def search_flights(
     body: SearchRequest = Body(...),
-    db: Session = Depends(get_db),
-    token: str = Depends(get_api_key)
+    db: Session = Depends(get_db)
 ):
     """
     Elasticsearch-style compatible endpoint.
@@ -224,9 +192,9 @@ def search_flights(
     Supports:
     - term.flight_id
     - terms.latest_status
-    - latest_etd now+6h exclusion
+    - must_not.range.latest_etd.gte
     - size
-    - sort
+    - multi-result responses
     """
 
     # -----------------------------------------------------
@@ -258,10 +226,53 @@ def search_flights(
             break
 
     # -----------------------------------------------------
-    # Handle latest_etd exclusion
+    # Parse dynamic ETD exclusion
+    # Supports:
+    # now+6h
+    # now+2h
+    # etc.
     # -----------------------------------------------------
 
-    six_hours_from_now = datetime.utcnow() + timedelta(hours=6)
+    etd_cutoff = None
+
+    for f in body.query.bool.filter:
+
+        if (
+            f.bool
+            and f.bool.must_not
+            and f.bool.must_not.range
+            and f.bool.must_not.range.latest_etd
+            and f.bool.must_not.range.latest_etd.gte
+        ):
+
+            gte_value = (
+                f.bool.must_not.range.latest_etd.gte
+            )
+
+            if (
+                gte_value.startswith("now+")
+                and gte_value.endswith("h")
+            ):
+
+                hours = int(
+                    gte_value
+                    .replace("now+", "")
+                    .replace("h", "")
+                )
+
+                etd_cutoff = (
+                    datetime.utcnow()
+                    + timedelta(hours=hours)
+                )
+
+            break
+
+    # Default fallback
+    if etd_cutoff is None:
+        etd_cutoff = (
+            datetime.utcnow()
+            + timedelta(hours=6)
+        )
 
     # -----------------------------------------------------
     # Base query
@@ -270,22 +281,32 @@ def search_flights(
     query = db.query(FlightDB).filter(
         FlightDB.callsign == flight_id,
         FlightDB.flight_status.in_(statuses),
-        FlightDB.updated_etd < six_hours_from_now
+        or_(
+            FlightDB.updated_etd.is_(None),
+            FlightDB.updated_etd < etd_cutoff
+        )
     )
 
     # -----------------------------------------------------
     # Sorting
-    # ACTIVE first
-    # then most recent ETD
+    #
+    # ACTIVE + ENROUTE first
+    # then newest ETD
     # -----------------------------------------------------
 
-    active_priority = case(
-        (FlightDB.flight_status == "ACTIVE", 1),
+    priority_status = case(
+        (
+            FlightDB.flight_status.in_([
+                "ACTIVE",
+                "ENROUTE"
+            ]),
+            1
+        ),
         else_=0
     )
 
     query = query.order_by(
-        desc(active_priority),
+        desc(priority_status),
         desc(FlightDB.updated_etd)
     )
 
