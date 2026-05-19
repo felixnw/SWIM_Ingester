@@ -178,7 +178,11 @@ DO UPDATE SET
         flights.updated_etd
     ),
 
-    flight_status = EXCLUDED.flight_status,
+    flight_status = COALESCE(
+    EXCLUDED.flight_status,
+    flights.flight_status
+    ),
+    
     last_updated = CURRENT_TIMESTAMP;
 """
 
@@ -397,21 +401,24 @@ def parse_tfm_fields(msg):
                     aircraft_type = spec_raw
 
         # ====================================================
-        # STATUS
+        # FAA STATUS
         # ====================================================
 
-        status_map = {
-            "trackInformation": "ENROUTE",
-            "FlightModify": "AMENDED",
-            "ncsmFlightModify": "AMENDED",
-            "nccmFlightModify": "AMENDED",
-            "FlightTimes": "ACTIVE",
-            "ncsmFlightTimes": "ACTIVE",
-            "arrivalInformation": "ARRIVED",
-            "departureInformation": "DEPARTED",
-        }
+        status = None
 
-        status = status_map.get(msg_type, "UNKNOWN")
+        if isinstance(status_spec, dict):
+
+            raw_status = status_spec.get(
+                "flightStatus"
+            )
+
+            if raw_status:
+
+                status = (
+                    str(raw_status)
+                    .strip()
+                    .upper()
+                )
 
         # ====================================================
         # TIME EXTRACTION
