@@ -46,13 +46,15 @@ class FlightDB(Base):
     origin = Column(String)
     destination = Column(String)
 
-    original_etd = Column(DateTime)
-    updated_etd = Column(DateTime)
+    original_etd = Column(DateTime(timezone=True))
+    updated_etd = Column(DateTime(timezone=True))
 
-    original_eta = Column(DateTime)
-    updated_eta = Column(DateTime)
+    original_eta = Column(DateTime(timezone=True))
+    updated_eta = Column(DateTime(timezone=True))
 
     flight_status = Column(String)
+
+    last_updated = Column(DateTime(timezone=True))
 
 
 # =========================================================
@@ -131,6 +133,8 @@ class FlightSource(BaseModel):
 
     original_etd: Optional[datetime] = None
     original_eta: Optional[datetime] = None
+
+    last_update: Optional[datetime] = None
 
     model_config = ConfigDict(
         from_attributes=True
@@ -298,8 +302,7 @@ def search_flights(
     priority_status = case(
         (
             FlightDB.flight_status.in_([
-                "ACTIVE",
-                "ENROUTE"
+                "ACTIVE"
             ]),
             1
         ),
@@ -308,7 +311,7 @@ def search_flights(
 
     query = query.order_by(
         desc(priority_status),
-        desc(FlightDB.updated_etd)
+        desc(FlightDB.last_updated)
     )
 
     # -----------------------------------------------------
@@ -329,6 +332,13 @@ def search_flights(
 
     for f in flights:
 
+        arrival_delay_minutes = None
+
+        if f.original_eta and f.updated_eta:
+            arrival_delay_minutes = int(
+                (f.updated_eta - f.original_eta).total_seconds() / 60
+            )
+
         source_data = FlightSource(
             flight_id=f.callsign,
             registration=f.tail_number,
@@ -341,7 +351,9 @@ def search_flights(
             latest_etd=f.updated_etd,
             latest_eta=f.updated_eta,
             original_etd=f.original_etd,
-            original_eta=f.original_eta
+            original_eta=f.original_eta,
+            last_update=f.last_updated,
+            arrival_delay_minutes=arrival_delay_minutes
         )
 
         formatted_hits.append(
