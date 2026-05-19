@@ -15,3 +15,28 @@ db_params = {
     "keepalives_interval": 10,
     "keepalives_count": 5
 }
+
+solace_props = {
+    "solace.messaging.transport.host":
+        "tcps://ems1.swim.faa.gov:55443",
+
+    "solace.messaging.service.vpn-name":
+        "TFMS",
+
+    "solace.messaging.authentication.scheme.basic.username":
+        swim_username,
+
+    "solace.messaging.authentication.scheme.basic.password":
+        swim_password,
+
+    "solace.messaging.transport.compression-level":
+        "1",
+
+    # PRODUCTION:
+    # Replace with real cert validation later
+    "solace.messaging.tls.cert-validated":
+        False,
+
+    "solace.messaging.tls.cert-validate-servername":
+        False,
+}

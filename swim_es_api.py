@@ -219,7 +219,7 @@ def search_flights(
     # Extract statuses
     # -----------------------------------------------------
 
-    statuses = ["ACTIVE", "PLANNED", "PROPOSED", "ENROUTE"]
+    statuses = ["ACTIVE", "PLANNED", "PROPOSED"]
 
     for f in body.query.bool.filter:
         if f.terms and f.terms.latest_status:
