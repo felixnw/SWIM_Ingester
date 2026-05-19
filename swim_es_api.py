@@ -177,8 +177,9 @@ app = FastAPI(title="SWIM-Compatible Flight API")
 # Endpoint
 # =========================================================
 
-@app.post(
+@app.api_route(
     "/swim-combined-flights/_search",
+    methods=["GET", "POST"],
     response_model=ESResponse,
     response_model_by_alias=True
 )
@@ -218,7 +219,7 @@ def search_flights(
     # Extract statuses
     # -----------------------------------------------------
 
-    statuses = ["ACTIVE", "PLANNED", "PROPOSED"]
+    statuses = ["ACTIVE", "PLANNED", "PROPOSED", "ENROUTE"]
 
     for f in body.query.bool.filter:
         if f.terms and f.terms.latest_status:
